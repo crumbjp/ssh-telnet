@@ -1,0 +1,80 @@
+#!/usr/bin/env perl
+
+use MIME::Base64;
+use IPC::Open3;
+use Socket;
+use strict;
+use warnings;
+
+my $BUFSIZ = 1024;
+
+#$|=1;
+my $SSH_HOST = $ARGV[0];
+my $SSH_PORT = $ARGV[1];
+my $LOG_FILE = $ARGV[2]?$ARGV[2]:'/dev/null';
+my $timeout = 1;
+
+
+
+socket(my $sock, PF_INET, SOCK_STREAM, getprotobyname('tcp' )) || die "socket: $!";
+connect($sock, sockaddr_in($SSH_PORT, inet_aton($SSH_HOST))) || die "connect: $!";
+open(my $LOG,'> '.$LOG_FILE);
+sub logging {
+    my ($msg) = @_;
+    syswrite($LOG,$msg,length($msg));
+}
+logging( "== START ==\n");
+logging( "connect => $SSH_HOST : $SSH_PORT\n");
+
+$SIG{'PIPE'} = $SIG{'HUP'} = $SIG{'INT'} = $SIG{'QUIT'} = $SIG{'HUP'} = $SIG{'TERM'} = 'sigterm';
+sub sigterm {
+    logging("SIG: kill -9 $$\n");
+    kill(9,$$);
+}
+
+eval {
+    my $sno = fileno($sock);
+    my $ino = fileno(STDIN);
+    while(1) {
+	my $rin = "";
+	vec($rin, $sno, 1)=1;
+	vec($rin, $ino, 1)=1;
+	my $ret = select(my $rout=$rin,undef,undef,undef);
+	if ( $ret <= 0 ) {
+	    die "select error : $!";
+	}
+	if ( vec($rout, $sno, 1) == 1 ) {
+	    my $buf;
+	    if ( sysread($sock,$buf,$BUFSIZ) <= 0){
+		die "sysread SOCK error : $!";
+	    }
+	    logging("SOCK (".length($buf).")\n");
+	    $buf = encode_base64($buf,'')."\n";
+	    logging("SOCK_SEND (".length($buf)."): $buf\n");
+	    my $n = syswrite(STDOUT,$buf,length($buf));
+	    logging("SOCK_SENT ($n)\n\n");
+	    if ( $n  <= 0 ){
+		die "syswrite STDERR error : $!";
+	    }
+	}
+	if ( vec($rout, $ino, 1) == 1 ) {
+	    my $line = <STDIN>;
+	    if ( ! $line ) {
+		die "";
+	    }
+	    logging( "IN (".length($line).")  : $line\n");
+	    chomp($line);
+	    $line = decode_base64($line);
+	    my $n = syswrite($sock,$line,length($line));
+	    logging("IN_SOCK ($n)\n\n");
+	    if ( $n <= 0 ){
+		die "syswrite SOCK error : $!";
+	    }
+	}
+    }
+};
+if ( $@ ) {
+    logging("$@\n");
+}
+logging("== END == \n");
+close($LOG);

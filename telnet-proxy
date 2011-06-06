@@ -1,0 +1,156 @@
+#!/usr/bin/env perl
+#---------------------------------------------
+# telnet-proxy - ssh tenlet tunnel
+#
+#   Should be more secure !
+#
+#   1. Set your ~/.ssh/config
+#   2. Put "ssh-proxy" script on the <telnet-host>
+#   3. You can use "~/.ssh/passwd" if you want.
+#   4. Have fun !!
+#   5. And ... You must input '~.' if you want to disconnect.
+#
+# Set following lines into the ~/.ssh/config
+#
+#   Host <login-host>
+#	  ProxyCommand ~/telnet-proxy <telnet-user> <telnet-host> <telnet-port> %h %p
+#
+#
+# For example..
+#
+#   Host www.crumb.jp
+#         ProxyCommand ~/telnet-proxy crumbjp telnet.crumb.jp 23 %h %p
+#
+#---------------------------------------------
+
+
+use MIME::Base64;
+use Socket;
+use strict;
+use warnings;
+
+my $BUFSIZ = 189;
+
+#$|=1;
+my $REMOTE_USRR = $ARGV[0];
+my $REMOTE_HOST = $ARGV[1];
+my $REMOTE_PORT = $ARGV[2];
+my $SSH_HOST    = $ARGV[3];
+my $SSH_PORT    = $ARGV[4];
+my $LOG_FILE    = $ARGV[5]?$ARGV[5]:'/dev/null';
+# $LOG_FILE = 'telnet-proxy.log';
+my $PASSWD_FILE = $ENV{'HOME'}.'/.ssh/passwd';
+use IPC::Open3;
+
+
+
+open(my $LOG,'> '.$LOG_FILE);
+sub logging {
+    my ($msg) = @_;
+    syswrite($LOG,$msg,length($msg));
+}
+logging( "== START ==\n");
+
+my $passwd = undef;
+
+if ( -f $PASSWD_FILE ) {
+    open(my $PW,'<'.$PASSWD_FILE);
+    $passwd = <$PW>;
+    close($PW);
+}
+if ( ! $passwd ) {
+    system('stty -F /dev/tty -echo');
+    open(my $TTY,'/dev/tty');
+    syswrite(STDERR,'Password:',length('Password:'));
+    sysread($TTY,$passwd,128);
+    close($TTY);
+    system('stty -F /dev/tty echo');
+}
+my $CMD = 'telnet -E -8 -l ' . $REMOTE_USRR . ' ' . $REMOTE_HOST . ' ' . $REMOTE_PORT;
+my $pid = open3(my $W, my $R, my $E, $CMD);
+
+$SIG{'USR1'} = $SIG{'PIPE'} = $SIG{'HUP'} = $SIG{'INT'} = $SIG{'QUIT'} = $SIG{'HUP'} = $SIG{'TERM'} = 'sigterm';
+sub sigterm {
+    logging("SIG: kill -9 $pid\n");
+    kill(9,$pid);
+}
+
+eval {
+    receive_and_do($W,$R,5,'Password:',$passwd."\n");
+    receive_and_do($W,$R,5,'\$|>','bash '."\n");
+    receive_and_do($W,$R,5,'\$','stty -echo '."\n");
+    receive_and_do($W,$R,5,'\$','LC_ALL=C ~/ssh-proxy '.$SSH_HOST.' '.$SSH_PORT."\n");
+    #receive_and_do($W,$R,5,'\$','LC_ALL=C ~/ssh-proxy '.$SSH_HOST.' '.$SSH_PORT." ssh-proxy.log\n");
+    sleep(1);
+    my $tno = fileno($R);
+    my $ino = fileno(STDIN);
+    while (1) {
+	select(undef,undef,undef,0.0001);
+	my $rin = "";
+	vec($rin, $tno, 1)=1;
+	vec($rin, $ino, 1)=1;
+	my $ret = select(my $rout=$rin,undef,undef,undef);
+	if ( $ret <= 0 ) {
+	    die "select error : $!";
+	}
+	if ( vec($rout, $tno, 1) == 1 ) {
+	    my $line = <$R>;
+	    if ( ! $line ) {
+		die "";
+	    }
+ 	    logging("RCV (".length($line)."): $line\n");
+	    chomp($line);
+ 	    $line = decode_base64($line);
+	    my $n = syswrite(STDOUT,$line,length($line));
+ 	    logging("RCVD($n)\n\n");
+	    if ( $n <= 0 ){
+		die "syswrite STDOUT error : $!";
+	    }
+	}
+	if ( vec($rout, $ino, 1) == 1 ) {
+	    my $buf=undef;
+	    if ( sysread(STDIN,$buf,$BUFSIZ) <= 0){
+		die "sysread STDIN error : $!";
+	    }
+	    logging("SEND (".length($buf).")\n");
+	    $buf = encode_base64($buf,'')."\n";
+	    logging("SEND (".length($buf).") : $buf");
+	    my $n = syswrite($W,$buf,length($buf));
+	    logging("SENT ($n)\n\n");
+	    if ( $n <= 0 ){
+		die "syswrite TELNET error : $!";
+	    }
+	}
+    }
+};
+if ( $@ ) {
+    logging("$@\n");
+    kill(9,$pid);
+}
+logging("== END == \n");
+close($LOG);
+sub receive_and_do {
+    my ($W,$R,$timeout,$cnd,$cmd) = @_;
+    my $rbuf = '';
+    my $rin = '';
+    while (1) {
+	my $buf;
+	vec($rin, fileno($R), 1)=1;
+	my $ret = select(my $rout=$rin,undef,undef,$timeout);
+	if ( $ret != 1 ) {
+	    die "select error : $!";
+	}
+	if ( sysread($R,$buf,$BUFSIZ) <= 0){
+	    die "sysread STDIN error : $!";
+	}
+	logging("IN  : $buf\n");
+	$rbuf .= $buf;
+	if ( $buf =~ /$cnd/ ) {
+	    logging("CMD : $cmd\n");
+	    syswrite($W,$cmd,length($cmd));
+	    return;
+	}
+    }
+}
+
+waitpid($pid,0);
